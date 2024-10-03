@@ -15,9 +15,12 @@ import toml
 from flask import Flask, request, abort, send_from_directory
 import time
 
-sortition_db = "mainnet/burnchain/sortition/marf.sqlite"
-chainstate_db = "mainnet/chainstate/vm/index.sqlite"
-mempool_db = "mainnet/chainstate/mempool.sqlite"
+# sortition_db = "mainnet/burnchain/sortition/marf.sqlite"
+# chainstate_db = "mainnet/chainstate/vm/index.sqlite"
+# mempool_db = "mainnet/chainstate/mempool.sqlite"
+sortition_db = "nakamoto-neon/burnchain/sortition/marf.sqlite"
+chainstate_db = "nakamoto-neon/chainstate/vm/index.sqlite"
+mempool_db = "nakamoto-neon/chainstate/mempool.sqlite"
 default_color = "white"
 cost_limits = {
     "write_length": 15_000_000,
@@ -28,6 +31,7 @@ cost_limits = {
     "size": 2 * 1024 * 1024,
 }
 bitcoin_tx_db = "output/bitcoin-tx.sqlite"
+bitcoin_api_url = "https://mempool.space/api/tx"
 
 
 def is_miner_known(miner_config, identifier):
@@ -79,7 +83,7 @@ def get_miner_group(miner_config, identifier):
 class Commit:
     def __init__(
         self,
-        block_header_hash,
+        burn_header_hash,
         txid,
         sender,
         burn_block_height,
@@ -102,7 +106,7 @@ class Commit:
         potential_tip=False,
         next_tip=False,
     ):
-        self.block_header_hash = block_header_hash
+        self.burn_header_hash = burn_header_hash
         self.txid = txid
         self.sender = sender[1:-1]  # Remove quotes
         self.burn_block_height = burn_block_height
@@ -126,7 +130,7 @@ class Commit:
         self.next_tip = next_tip
 
     def __repr__(self):
-        return f"Commit({self.block_header_hash[:8]}, Burn Block Height: {self.burn_block_height}, Spend: {self.spend:,})"
+        return f"Commit({self.burn_header_hash[:8]}, Burn Block Height: {self.burn_block_height}, Spend: {self.spend:,})"
 
     def get_fullness(self):
         fullness = max(
@@ -153,7 +157,7 @@ class Miner:
         return f"Miner({self.address}, {self.name}, {self.group})"
 
 
-def get_block_commits_with_parents(db_path, start_block, num_blocks=100):
+def get_block_commits_with_parents(db_path, start_block, start_height_30, num_blocks=100):
     conn = sqlite3.connect(os.path.join(db_path, sortition_db))
     cursor = conn.cursor()
 
@@ -163,6 +167,7 @@ def get_block_commits_with_parents(db_path, start_block, num_blocks=100):
     query = """
     SELECT
         block_header_hash,
+        burn_header_hash,
         txid,
         apparent_sender,
         sortition_id,
@@ -184,10 +189,11 @@ def get_block_commits_with_parents(db_path, start_block, num_blocks=100):
     # Prepare dictionaries to hold the parent hashes and total spends
     parent_hashes = {}
     sortition_sats = {}
-    commits = {}  # Track all nodes, by block_header_hash
+    commits = {}  # Track all nodes, by header_hash
 
     for (
         block_header_hash,
+        burn_header_hash,
         txid,
         apparent_sender,
         sortition_id,
@@ -197,37 +203,61 @@ def get_block_commits_with_parents(db_path, start_block, num_blocks=100):
         parent_block_ptr,
         parent_vtxindex,
     ) in raw_commits:
-        parent = parent_hashes.get((parent_block_ptr, parent_vtxindex))
+        if block_height >= start_height_30:
+            parent = parent_hashes.get((parent_block_ptr, parent_vtxindex))
 
-        commits[block_header_hash] = Commit(
-            block_header_hash,
-            txid,
-            apparent_sender,
-            block_height,
-            int(burn_fee),
-            sortition_id,
-            parent,
-        )
-        parent_hashes[(block_height, vtxindex)] = block_header_hash
-        sortition_sats[sortition_id] = sortition_sats.get(sortition_id, 0) + int(
-            burn_fee
-        )
+            commits[burn_header_hash] = Commit(
+                burn_header_hash,
+                txid,
+                apparent_sender,
+                block_height,
+                int(burn_fee),
+                sortition_id,
+                parent,
+            )
+            parent_hashes[(block_height, vtxindex)] = burn_header_hash
+            sortition_sats[sortition_id] = sortition_sats.get(sortition_id, 0) + int(
+                burn_fee
+            )
+        else:
+            parent = parent_hashes.get((parent_block_ptr, parent_vtxindex))
+
+            commits[block_header_hash] = Commit(
+                block_header_hash,
+                txid,
+                apparent_sender,
+                block_height,
+                int(burn_fee),
+                sortition_id,
+                parent,
+            )
+            parent_hashes[(block_height, vtxindex)] = block_header_hash
+            sortition_sats[sortition_id] = sortition_sats.get(sortition_id, 0) + int(
+                burn_fee
+            )
 
     conn.close()
     return commits, sortition_sats
 
 
-def mark_canonical_blocks(db_path, commits, start_block):
+def mark_canonical_blocks(db_path, commits, start_block, start_height_30):
     conn = sqlite3.connect(os.path.join(db_path, sortition_db))
     cursor = conn.cursor()
 
     for block_height in sorted(
         set(commit.burn_block_height for commit in commits.values())
     ):
-        (winning_block_txid, stacks_height, consensus_hash) = cursor.execute(
-            "SELECT winning_block_txid, stacks_block_height, consensus_hash FROM snapshots WHERE block_height = ?;",
-            (block_height,),
-        ).fetchone()
+        if block_height >= start_height_30:
+            (winning_block_txid, stacks_height, consensus_hash) = cursor.execute(
+                "SELECT winning_block_txid, canonical_stacks_tip_height, consensus_hash FROM snapshots WHERE block_height = ?;",
+                (block_height,),
+            ).fetchone()
+            stacks_height = stacks_height + 1
+        else:
+            (winning_block_txid, stacks_height, consensus_hash) = cursor.execute(
+                "SELECT winning_block_txid, stacks_block_height, consensus_hash FROM snapshots WHERE block_height = ?;",
+                (block_height,),
+            ).fetchone()
 
         for commit in filter(
             lambda x: x.burn_block_height == block_height, commits.values()
@@ -242,7 +272,7 @@ def mark_canonical_blocks(db_path, commits, start_block):
                 if commit.parent and commit.parent in commits:
                     parent_commit = commits[commit.parent]
                     parent_commit.potential_tip = False
-                    commit.stacks_height = parent_commit.stacks_height + 1
+                    commit.stacks_height = stacks_height
 
                 # If the stacks_height is greater than 0, this block has been processed.
                 if stacks_height > 0:
@@ -252,38 +282,76 @@ def mark_canonical_blocks(db_path, commits, start_block):
                     )
                     chainstate_cursor = chainstate_conn.cursor()
                     # Execute the query
-                    result = chainstate_cursor.execute(
-                        "SELECT block_hash, coinbase, tx_fees_anchored, tx_fees_streamed FROM payments WHERE consensus_hash = ?;",
-                        (consensus_hash,),
-                    ).fetchone()
+                    if block_height >= start_height_30:
+                        result = chainstate_cursor.execute(
+                            "SELECT block_hash, coinbase FROM payments WHERE consensus_hash = ?;",
+                            (consensus_hash,),
+                        ).fetchone()
 
-                    if result:
-                        (
-                            block_hash,
-                            coinbase,
-                            tx_fees_anchored,
-                            tx_fees_streamed,
-                        ) = result
-                        commit.block_hash = block_hash
-                        commit.coinbase_earned = int(coinbase)
-                        commit.fees_earned = int(tx_fees_anchored) + int(
-                            tx_fees_streamed
-                        )
+                        max_fees = chainstate_cursor.execute(
+                            "SELECT tenure_tx_fees FROM nakamoto_block_headers WHERE burn_header_height = ? ORDER BY height_in_tenure DESC LIMIT 1;",
+                            (block_height,),
+                        ).fetchone()
 
-                    # Fetch the block costs and size
-                    result = chainstate_cursor.execute(
-                        "SELECT cost, block_size FROM block_headers WHERE block_hash = ?;",
-                        (block_hash,),
-                    ).fetchone()
-                    if result:
-                        cost_string, block_size = result
-                        costs = json.loads(cost_string)
-                        commit.read_length = int(costs["read_length"])
-                        commit.read_count = int(costs["read_count"])
-                        commit.write_length = int(costs["write_length"])
-                        commit.write_count = int(costs["write_count"])
-                        commit.runtime = int(costs["runtime"])
-                        commit.block_size = int(block_size)
+                        if result and max_fees:
+                            (
+                                block_hash,
+                                coinbase,
+                            ) = result
+                            (
+                                fees,
+                            ) = max_fees
+                            commit.block_hash = block_hash
+                            commit.coinbase_earned = int(coinbase)
+                            commit.fees_earned = int(fees)
+
+                        # Fetch the block costs and size
+                        result = chainstate_cursor.execute(
+                            "SELECT cost, block_size FROM nakamoto_block_headers WHERE block_hash = ?;",
+                            (block_hash,),
+                        ).fetchone()
+                        if result:
+                            cost_string, block_size = result
+                            costs = json.loads(cost_string)
+                            commit.read_length = int(costs["read_length"])
+                            commit.read_count = int(costs["read_count"])
+                            commit.write_length = int(costs["write_length"])
+                            commit.write_count = int(costs["write_count"])
+                            commit.runtime = int(costs["runtime"])
+                            commit.block_size = int(block_size)
+                    else:
+                        result = chainstate_cursor.execute(
+                            "SELECT block_hash, coinbase, tx_fees_anchored, tx_fees_streamed FROM payments WHERE consensus_hash = ?;",
+                            (consensus_hash,),
+                        ).fetchone()
+
+                        if result:
+                            (
+                                block_hash,
+                                coinbase,
+                                tx_fees_anchored,
+                                tx_fees_streamed,
+                            ) = result
+                            commit.block_hash = block_hash
+                            commit.coinbase_earned = int(coinbase)
+                            commit.fees_earned = int(tx_fees_anchored) + int(
+                                tx_fees_streamed
+                            )
+
+                        # Fetch the block costs and size
+                        result = chainstate_cursor.execute(
+                            "SELECT cost, block_size FROM block_headers WHERE block_hash = ?;",
+                            (block_hash,),
+                        ).fetchone()
+                        if result:
+                            cost_string, block_size = result
+                            costs = json.loads(cost_string)
+                            commit.read_length = int(costs["read_length"])
+                            commit.read_count = int(costs["read_count"])
+                            commit.write_length = int(costs["write_length"])
+                            commit.write_count = int(costs["write_count"])
+                            commit.runtime = int(costs["runtime"])
+                            commit.block_size = int(block_size)
 
                     chainstate_conn.close()
 
@@ -293,10 +361,16 @@ def mark_canonical_blocks(db_path, commits, start_block):
                     commit.stacks_height = parent_commit.stacks_height + 1
 
     # Mark the canonical chain
-    canonical_tip = cursor.execute(
-        "SELECT canonical_stacks_tip_hash FROM snapshots WHERE block_height = ?;",
-        (start_block,),
-    ).fetchone()[0]
+    if block_height >= start_height_30:
+        canonical_tip = cursor.execute(
+            "SELECT burn_header_hash FROM snapshots WHERE block_height = ?;",
+            (start_block,),
+        ).fetchone()[0]
+    else:
+        canonical_tip = cursor.execute(
+            "SELECT canonical_stacks_tip_hash FROM snapshots WHERE block_height = ?;",
+            (start_block,),
+        ).fetchone()[0]
     conn.close()
     if canonical_tip in commits:
         commits[canonical_tip].tip = True
@@ -368,7 +442,7 @@ Tracked Spend: {tracked_spend:,} ({tracked_spend/sortition_sats[commit.sortition
                     )
 
                 # Now use the dictionary to set attributes
-                c.node(commit.block_header_hash, node_label, **node_attrs)
+                c.node(commit.burn_header_hash, node_label, **node_attrs)
 
                 if commit.parent:
                     # If the parent is not the previous block, color the edge red
@@ -382,7 +456,7 @@ Tracked Spend: {tracked_spend:,} ({tracked_spend/sortition_sats[commit.sortition
                         penwidth = "8"
                     c.edge(
                         commit.parent,
-                        commit.block_header_hash,
+                        commit.burn_header_hash,
                         color=color,
                         penwidth=penwidth,
                     )
@@ -411,6 +485,10 @@ def get_bitcoin_transaction_rpc(bitcoin_rpc_url, txid, block_hash):
 
 
 def ensure_bitcoin_tx_db_exists():
+    # Create the bitcoin transaction database's folder if it doesn't exist
+    bitcoin_db_folder = os.path.dirname(os.path.abspath(bitcoin_tx_db))
+    os.makedirs(bitcoin_db_folder, exist_ok=True)
+
     # Connect to the SQLite database (this will create it if it doesn't exist)
     conn = sqlite3.connect(bitcoin_tx_db)
 
@@ -439,7 +517,7 @@ def get_bitcoin_fee(txid):
         return row[0]
     else:
         # If not found, fetch from the API
-        url = f"https://mempool.space/api/tx/{txid}"
+        url = f"{bitcoin_api_url}/{txid}"
         response = requests.get(url)
 
         if response.status_code == 200:
@@ -451,6 +529,10 @@ def get_bitcoin_fee(txid):
             conn.commit()
             conn.close()
             return response.json()["fee"]
+        elif response.status_code == 429:
+            conn.close()
+            time.sleep(1)
+            return get_bitcoin_fee(txid)
         else:
             conn.close()
             return None
@@ -861,7 +943,7 @@ def send_no_canonical_block_alert(miner_config):
     if not webhook or not alert_low_total_spend:
         return
 
-    tip = get_tip(miner_config.get("db_path"))
+    tip = get_tip(miner_config.get("node").get("working_dir"))
 
     last_alert_block = miner_config.get("last_block", tip)
     last_alert_time = miner_config.get("last_alert_time", int(time.time()))
@@ -943,13 +1025,13 @@ def get_score_to_common_ancestor(tips, commits):
 
     tips_at_same_height = []
     for tip in tips:
-        scores[tip.block_header_hash] = (
-            commits[tip.block_header_hash].burn_block_height
-            - commits[tip.block_header_hash].stacks_height
-        ) * (max_height - commits[tip.block_header_hash].stacks_height)
+        scores[tip.burn_header_hash] = (
+            commits[tip.burn_header_hash].burn_block_height
+            - commits[tip.burn_header_hash].stacks_height
+        ) * (max_height - commits[tip.burn_header_hash].stacks_height)
         commit = tip
         while commit.stacks_height > min_height:
-            scores[tip.block_header_hash] += (
+            scores[tip.burn_header_hash] += (
                 commit.burn_block_height - commit.stacks_height
             )
             commit = commits.get(commit.parent)
@@ -970,7 +1052,7 @@ def get_score_to_common_ancestor(tips, commits):
 
         # Update the scores
         for tip, commit in tips_at_same_height:
-            scores[tip.block_header_hash] += (
+            scores[tip.burn_header_hash] += (
                 commit.burn_block_height - commit.stacks_height
             )
 
@@ -1035,6 +1117,26 @@ def get_tip(db_path):
     return tip
 
 
+def get_epoch_30_start_block(db_path):
+    conn = sqlite3.connect(os.path.join(db_path, sortition_db))
+    cursor = conn.cursor()
+
+    result = cursor.execute(
+        "SELECT start_block_height FROM epochs WHERE epoch_id = 12288",
+        (),
+    ).fetchone()
+
+    conn.close()
+
+    if result:
+        (
+            start_block_height,
+        ) = result
+        return start_block_height
+    else:
+        return 0
+
+
 def run_command_line(args):
     with open(args.config_path, "r") as file:
         miner_config = toml.load(file)
@@ -1042,24 +1144,26 @@ def run_command_line(args):
     if args.at_tip:
         start_block = int(args.at_tip)
     else:
-        start_block = get_tip(miner_config.get("db_path"))
+        start_block = get_tip(miner_config.get("node").get("working_dir"))
 
     ensure_bitcoin_tx_db_exists()
+
+    start_height_30 = get_epoch_30_start_block(miner_config.get("node").get("working_dir"))
 
     for index, num_blocks in enumerate(args.block_counts):
         print(f"Generating graph for blocks...")
         commits, sortition_sats = get_block_commits_with_parents(
-            miner_config.get("db_path"), start_block, num_blocks
+            miner_config.get("node").get("working_dir"), start_block, start_height_30, num_blocks
         )
         canonical_tip = mark_canonical_blocks(
-            miner_config.get("db_path"), commits, start_block
+            miner_config.get("node").get("working_dir"), commits, start_block, start_height_30
         )
         mark_next_tip(canonical_tip, miner_config.get("max_fork_depth", 3), commits)
 
         svg_string = create_graph(miner_config, commits, sortition_sats)
 
         stats = collect_stats(miner_config, commits)
-        stats["mempool"] = get_mempool_stats(miner_config.get("db_path"))
+        stats["mempool"] = get_mempool_stats(miner_config.get("node").get("working_dir"))
 
         send_new_miner_alerts(miner_config, stats)
         send_high_spend_alerts(miner_config, stats)
