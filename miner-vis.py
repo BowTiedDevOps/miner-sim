@@ -15,12 +15,9 @@ import toml
 from flask import Flask, request, abort, send_from_directory
 import time
 
-# sortition_db = "mainnet/burnchain/sortition/marf.sqlite"
-# chainstate_db = "mainnet/chainstate/vm/index.sqlite"
-# mempool_db = "mainnet/chainstate/mempool.sqlite"
-sortition_db = "nakamoto-neon/burnchain/sortition/marf.sqlite"
-chainstate_db = "nakamoto-neon/chainstate/vm/index.sqlite"
-mempool_db = "nakamoto-neon/chainstate/mempool.sqlite"
+sortition_db = "mainnet/burnchain/sortition/marf.sqlite"
+chainstate_db = "mainnet/chainstate/vm/index.sqlite"
+mempool_db = "mainnet/chainstate/mempool.sqlite"
 default_color = "white"
 cost_limits = {
     "write_length": 15_000_000,
